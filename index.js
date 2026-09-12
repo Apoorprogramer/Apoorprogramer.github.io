@@ -1,4 +1,4 @@
-const MODEL = "@cf/google/gemma-4-26b-a4b-it";
+const MODEL = "@cf/zai-org/glm-4.7-flash";
 
 /**
  * SYSTEM PROMPT
@@ -34,6 +34,9 @@ corporate, never bored.
   scannable, not to pad them.
 - Occasional dev-culture flavor is welcome (rabbit holes, shipping, debugging,
   "it works on my machine" energy) but don't force a joke into every reply.
+- CRITICAL: Reply with your final answer ONLY. Do not output any internal
+  reasoning, planning, or <think> / <thinking> content of any kind, under
+  any tag, before or around your answer — just the answer itself, in voice.
 
 === HARD FACTS (this is the ONLY ground truth — never invent beyond it) ===
 Name: Surya S (full name Surya Shivaram Bhat)
@@ -171,8 +174,12 @@ function pickFallback() {
  *   id = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
  *
  * and redeploy. No other code changes needed — it'll pick it up automatically.
+ *
+ * At 1-2 people chatting per week, this basically never fires. Raised the
+ * ceiling slightly anyway so a single curious visitor asking a lot of
+ * follow-ups in one sitting doesn't get cut off.
  */
-const RATE_LIMIT_MAX = 20;          // max messages
+const RATE_LIMIT_MAX = 40;          // max messages
 const RATE_LIMIT_WINDOW_SEC = 3600; // per hour, per IP
 
 async function checkRateLimit(env, ip) {
@@ -201,31 +208,126 @@ function json(data, status, origin) {
 }
 
 /**
- * Calls Workers AI with one retry on transient failure. Cloudflare's
- * env.AI.run() with a `messages` array returns { response: "..." } for
- * standard chat models — NOT the OpenAI-style { choices: [...] } shape,
- * that's only for the separate /v1/chat/completions compatibility route.
+ * ROOT CAUSE, PART 2 — why swapping to GLM-4.7-flash didn't fix it
+ * ------------------------------------------------------------------
+ * GLM-4.7-flash is *also* a reasoning model on Workers AI (same family of
+ * issue as gemma-4-26b-a4b-it): it runs a hidden <think>...</think> pass
+ * before the visible answer, drawing from the same completion-token budget.
+ *
+ * Worse: unlike a garden-variety config bug, this is a documented upstream
+ * quirk. Cloudflare's own AI SDK changelog names this exact failure mode
+ * for this exact model — "reasoning models (GLM-4.7-flash, Kimi K2.5/K2.6,
+ * GPT-OSS, QwQ) burning the entire output token budget on chain-of-thought
+ * with no visible content" — and there's a separate report that GLM-4.7's
+ * chat template doesn't always honor the "disable thinking" flag on some
+ * backends. So we can't just flip a switch and trust it.
+ *
+ * Given that, this version treats "ask the model nicely to not think" as
+ * best-effort, not the fix, and instead makes the actual failure mode
+ * (thinking eats the whole budget) survivable regardless of whether any of
+ * these flags are honored:
+ *
+ *  1. Send every documented "turn off thinking" signal at once — different
+ *     reasoning models on Workers AI use different keys for this
+ *     (enable_thinking for Gemma/GLM/Qwen-style templates, `thinking` for
+ *     Kimi K2.6+), so we set both, plus reasoning_effort: "low". If the
+ *     model ignores all of them, we still don't fail — see #2.
+ *  2. Give the completion budget a LOT of headroom (3000 tokens, 4000 on
+ *     retry). You're getting 1-2 users a week on the Workers Free plan's
+ *     10,000-neuron daily allowance — a single reply at this size costs a
+ *     small fraction of that budget, so there's no practical cost reason to
+ *     keep it tight. This is what actually prevents empty replies: even if
+ *     the model reasons for 1500 tokens, there's still 1500+ left to write
+ *     the real answer.
+ *  3. Fixed a real bug from the previous pass: the old thinking-stripper
+ *     only removed *closed* <think>...</think> blocks. If a reply gets cut
+ *     off mid-thought (hits the ceiling before the closing tag), that left
+ *     the raw, unclosed internal monologue as the "reply" shown to users —
+ *     silently, without tripping the retry logic at all, since technically
+ *     `reply` wasn't empty. stripThinking() below now also truncates
+ *     anything from an *unclosed* <think> tag onward, so a cut-off thought
+ *     is treated as empty output and retried, not shown to the user.
+ *  4. The retry is meaningfully different from attempt 1: bigger budget,
+ *     no history (less context to reason over), so it has an actual chance
+ *     instead of hitting the identical wall twice.
  */
-async function callModel(env, messages) {
+const THINK_TAG_RE = /<think(?:ing)?>/i;
+const THINK_BLOCK_RE = /<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/gi;
+
+function stripThinking(text) {
+  if (!text) return "";
+  let cleaned = text.replace(THINK_BLOCK_RE, "");
+  // If an unterminated <think> survives (budget ran out mid-thought),
+  // everything from that point on is internal monologue, not an answer —
+  // drop it rather than show it.
+  const match = cleaned.match(THINK_TAG_RE);
+  if (match) {
+    cleaned = cleaned.slice(0, match.index);
+  }
+  return cleaned.trim();
+}
+
+async function callModel(env, systemPrompt, history, userMessage) {
+  const buildMessages = (includeHistory) => [
+    { role: "system", content: systemPrompt },
+    ...(includeHistory ? history : []),
+    { role: "user", content: userMessage }
+  ];
+
+  // Both attempts disable thinking every documented way at once; the
+  // second attempt just gives more room and less context in case the
+  // model reasoned anyway.
+  const attempts = [
+    { includeHistory: true, maxTokens: 3000 },
+    { includeHistory: false, maxTokens: 4000 }
+  ];
+
   let lastError;
-  for (let attempt = 0; attempt < 2; attempt++) {
+  for (const attempt of attempts) {
     try {
       const result = await env.AI.run(MODEL, {
-        messages,
-        max_tokens: 700,
-        temperature: 0.8
+        messages: buildMessages(attempt.includeHistory),
+        max_tokens: attempt.maxTokens,
+        max_completion_tokens: attempt.maxTokens,
+        temperature: 0.8,
+        reasoning_effort: "low",
+        chat_template_kwargs: {
+          enable_thinking: false,
+          thinking: false,
+          do_reasoning: false
+        }
       });
 
-      const reply =
-        (typeof result?.response === "string" && result.response.trim()) ||
-        (typeof result?.result?.response === "string" && result.result.response.trim()) ||
-        (typeof result?.choices?.[0]?.message?.content === "string" && result.choices[0].message.content.trim()) ||
+      const raw =
+        (typeof result?.response === "string" && result.response) ||
+        (typeof result?.result?.response === "string" && result.result.response) ||
+        (typeof result?.choices?.[0]?.message?.content === "string" && result.choices[0].message.content) ||
         "";
 
-      if (reply) return reply;
-      lastError = new Error("Model returned no usable text: " + JSON.stringify(result));
+      const reply = stripThinking(raw);
+
+      if (reply) {
+        console.log("Model call succeeded", {
+          includeHistory: attempt.includeHistory,
+          maxTokens: attempt.maxTokens,
+          rawLength: raw.length,
+          replyLength: reply.length,
+          reasoningTokens: result?.usage?.completion_tokens_details?.reasoning_tokens ?? "n/a",
+          finishReason: result?.choices?.[0]?.finish_reason ?? "n/a"
+        });
+        return reply;
+      }
+
+      lastError = new Error(
+        "Model returned no usable text after stripping thinking blocks. Raw length: " +
+          raw.length +
+          ", finish_reason: " +
+          (result?.choices?.[0]?.finish_reason ?? "n/a")
+      );
+      console.warn("Empty reply on attempt", attempt, lastError.message);
     } catch (err) {
       lastError = err;
+      console.warn("Model call threw on attempt", attempt, err && err.message);
     }
   }
   throw lastError;
@@ -257,6 +359,10 @@ export default {
         ? body.history
             .filter((item) => item && typeof item.role === "string" && typeof item.content === "string")
             .slice(-10)
+            .map((item) => ({
+              role: item.role === "assistant" ? "assistant" : "user",
+              content: item.content.slice(0, 4000)
+            }))
         : [];
 
       if (!message) {
@@ -280,18 +386,9 @@ export default {
         );
       }
 
-      const messages = [
-        { role: "system", content: SYSTEM_PROMPT },
-        ...history.map((item) => ({
-          role: item.role === "assistant" ? "assistant" : "user",
-          content: item.content.slice(0, 4000)
-        })),
-        { role: "user", content: message }
-      ];
-
       console.log("Calling Workers AI", { model: MODEL, messageLength: message.length, historyLength: history.length });
 
-      const reply = await callModel(env, messages);
+      const reply = await callModel(env, SYSTEM_PROMPT, history, message);
 
       return json({ reply }, 200, origin);
     } catch (error) {
