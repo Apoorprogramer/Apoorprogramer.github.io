@@ -313,6 +313,11 @@ nav{
   align-items:center;justify-content:center;color:var(--text-muted);transition:.2s;
 }
 .hero-socials a:hover{color:var(--teal);border-color:var(--teal);transform:translateY(-3px);}
+.icon-mask{
+  width:16px;height:16px;display:inline-block;background-color:currentColor;
+  -webkit-mask:var(--mask-src) center/contain no-repeat;
+  mask:var(--mask-src) center/contain no-repeat;
+}
 
 /* terminal card */
 .terminal{
@@ -608,7 +613,10 @@ footer{border-top:1px solid var(--border-soft);padding:34px 0;}
 .chat-head{
   display:flex;align-items:center;gap:12px;padding:16px 18px;background:var(--bg-panel-2);border-bottom:1px solid var(--border);
 }
-.chat-avatar{width:36px;height:36px;border-radius:50%;background:linear-gradient(145deg,var(--pink),#c9457b);display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-weight:700;font-size:13px;flex:none;}
+.chat-avatar{width:36px;height:36px;border-radius:50%;background:linear-gradient(145deg,var(--pink),#c9457b);display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-weight:700;font-size:13px;flex:none;position:relative;overflow:hidden;}
+.chat-avatar img{width:100%;height:100%;object-fit:cover;position:absolute;inset:0;display:none;}
+.chat-avatar.has-image img{display:block;}
+.chat-avatar.has-image .chat-avatar-fallback{display:none;}
 .chat-head-text .name{font-weight:700;font-size:14px;}
 .chat-head-text .status{font-size:11.5px;color:var(--teal);display:flex;align-items:center;gap:5px;}
 .chat-head-text .status::before{content:'';width:6px;height:6px;border-radius:50%;background:var(--teal);}
@@ -750,6 +758,7 @@ a:focus-visible,button:focus-visible,input:focus-visible,textarea:focus-visible{
         <a href="mailto:off.suryas@gmail.com" aria-label="Email"><i class="fa-regular fa-envelope"></i></a>
         <a href="https://linkedin.com/in/surya-s-89b313246" target="_blank" rel="noopener" aria-label="LinkedIn"><i class="fa-brands fa-linkedin-in"></i></a>
         <a href="https://github.com/Apoorprogramer" target="_blank" rel="noopener" aria-label="GitHub"><i class="fa-brands fa-github"></i></a>
+        <a href="https://leetcode.com/u/surya_05/" target="_blank" rel="noopener" aria-label="LeetCode"><span class="icon-mask" style="--mask-src:url('https://cdn.simpleicons.org/leetcode/black');"></span></a>
         <a href="tel:+918088418460" aria-label="Phone"><i class="fa-solid fa-phone"></i></a>
       </div>
     </div>
@@ -1151,7 +1160,10 @@ a:focus-visible,button:focus-visible,input:focus-visible,textarea:focus-visible{
 <button id="chat-fab" aria-label="Chat with Surya's AI twin"><i class="fa-solid fa-message"></i><span class="ping"></span></button>
 <div id="chat-panel">
   <div class="chat-head">
-    <div class="chat-avatar">S</div>
+    <div class="chat-avatar" id="chat-avatar">
+      <span class="chat-avatar-fallback">S</span>
+      <img src="chat-avatar.png" alt="Surya's AI twin" id="chat-avatar-img">
+    </div>
     <div class="chat-head-text">
       <div class="name">Surya's AI Twin</div>
       <div class="status">Online · ask it anything</div>
@@ -1525,6 +1537,15 @@ document.getElementById('year').textContent = new Date().getFullYear();
    starting cold every time — this is what makes follow-up questions
    feel like a real conversation rather than isolated one-off calls.
    ================================================================ */
+// Drop a real image at chat-avatar.png in the repo root whenever it's ready —
+// this swaps it in automatically. Until then, it 404s quietly and the "S"
+// initial stays put. No code changes needed either way.
+(function(){
+  const wrap = document.getElementById('chat-avatar');
+  const img = document.getElementById('chat-avatar-img');
+  img.addEventListener('load', () => wrap.classList.add('has-image'));
+})();
+
 const CHAT_API = 'https://throbbing-wildflower-7f14.suryatesttheshit.workers.dev/api/chat';
 const CHAT_MAX_MESSAGE = 1200;
 const CHAT_MAX_HISTORY = 10;
@@ -1534,6 +1555,16 @@ const CLIENT_FALLBACKS = [
   "The rabbit hole caved in for a second 💀 Try that again?",
   "Lost the signal there — one more try should do it.",
   "That one didn't make it back. Send it again?"
+];
+
+// A fresh open (no restored history) picks one of these at random, instead
+// of a static "how can I help you" greeting — this is meant to sound like
+// Surya actually opening his mouth, not a support widget booting up.
+const INTRO_POOL = [
+  "oh good, a human. I'm Surya's AI twin — basically him, minus the coffee dependency. Ask me literally anything, I don't scare easy 👀",
+  "you rang? I live inside this portfolio and I know everything about the guy who built it. Try to stump me.",
+  "heads up: I'm not a support bot, I'm Surya with better uptime. Ask about the work, the stack, or come at me with something harder — I don't do canned answers.",
+  "welcome to the rabbit hole. I'm the version of Surya that never sleeps and never gets tired of talking about test automation. Go ahead, ask something."
 ];
 
 const chatFab = document.getElementById('chat-fab');
@@ -1596,7 +1627,20 @@ function addTyping(){
   return typing;
 }
 
-async function getAIResponse(userText){
+/**
+ * Streams the reply token-by-token instead of waiting for the whole thing.
+ * The worker sends one of two shapes:
+ *  - application/json  -> pre-model-call short-circuits (400/413/429). Same
+ *    handling as before, no streaming involved, resolved in one shot.
+ *  - text/event-stream -> the actual model reply, as `data: {"delta":"..."}`
+ *    frames, terminated by `data: [DONE]`. onDelta(text) fires per chunk so
+ *    the UI can render as it arrives; the promise resolves with the full
+ *    concatenated text once the stream ends.
+ *
+ * `onFirstDelta` fires once, right before the first visible character shows
+ * up — that's the cue to swap the typing indicator for a live message.
+ */
+async function streamAIResponse(userText, { onFirstDelta, onDelta }){
   let response;
   try {
     response = await fetch(CHAT_API, {
@@ -1613,25 +1657,69 @@ async function getAIResponse(userText){
     throw e;
   }
 
-  let data = {};
-  try { data = await response.json(); }
-  catch { throw new Error('The AI returned an invalid response.'); }
+  const contentType = response.headers.get('content-type') || '';
 
-  // 429 (rate limit) still comes back with a proper, friendly `reply` from
-  // the worker — treat it as a normal message, not a failure.
-  if(response.status === 429 && typeof data.reply === 'string' && data.reply.trim()){
-    return { text: data.reply.trim(), isRateLimit: true };
+  // Pre-model short-circuit: validation errors, rate limiting. Not streamed.
+  if(contentType.includes('application/json')){
+    let data = {};
+    try { data = await response.json(); }
+    catch { throw new Error('The AI returned an invalid response.'); }
+
+    if(response.status === 429 && typeof data.reply === 'string' && data.reply.trim()){
+      return { text: data.reply.trim(), isRateLimit: true };
+    }
+    if(!response.ok){
+      throw new Error(data.message || data.error || `Request failed (${response.status})`);
+    }
+    if(typeof data.reply !== 'string' || !data.reply.trim()){
+      throw new Error('The AI returned an empty response.');
+    }
+    onFirstDelta();
+    onDelta(data.reply.trim());
+    return { text: data.reply.trim(), isRateLimit: false };
   }
 
-  if(!response.ok){
-    throw new Error(data.message || data.error || `Request failed (${response.status})`);
+  if(!response.ok || !response.body){
+    throw new Error(`Request failed (${response.status})`);
   }
 
-  if(typeof data.reply !== 'string' || !data.reply.trim()){
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let full = '';
+  let started = false;
+
+  while(true){
+    const { value, done } = await reader.read();
+    if(done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    let sepIndex;
+    while((sepIndex = buffer.indexOf('\n\n')) !== -1){
+      const rawEvent = buffer.slice(0, sepIndex);
+      buffer = buffer.slice(sepIndex + 2);
+
+      const line = rawEvent.split('\n').find(l => l.startsWith('data:'));
+      if(!line) continue;
+      const payload = line.slice(5).trim();
+      if(payload === '[DONE]') continue;
+
+      let parsed;
+      try { parsed = JSON.parse(payload); } catch { continue; }
+
+      if(typeof parsed.delta === 'string' && parsed.delta){
+        if(!started){ started = true; onFirstDelta(); }
+        full += parsed.delta;
+        onDelta(parsed.delta);
+      }
+    }
+  }
+
+  if(!full.trim()){
     throw new Error('The AI returned an empty response.');
   }
 
-  return { text: data.reply.trim(), isRateLimit: false };
+  return { text: full.trim(), isRateLimit: false };
 }
 
 async function botReply(userText){
@@ -1640,11 +1728,20 @@ async function botReply(userText){
   chatSend.disabled = true;
   chatInput.disabled = true;
   const typing = addTyping();
+  let liveMsg = null;
+
+  const onFirstDelta = () => {
+    typing.remove();
+    liveMsg = addMsg('', 'bot');
+  };
+  const onDelta = (chunk) => {
+    if(!liveMsg) return;
+    liveMsg.textContent += chunk;
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+  };
 
   try {
-    const { text: reply, isRateLimit } = await getAIResponse(userText);
-    typing.remove();
-    addMsg(reply, 'bot');
+    const { text: reply, isRateLimit } = await streamAIResponse(userText, { onFirstDelta, onDelta });
 
     // Don't feed rate-limit notices into the model's own context — they're
     // not something Surya's AI twin "said" in character.
@@ -1664,7 +1761,11 @@ async function botReply(userText){
     const pool = error.isNetwork
       ? ["Can't reach the backend right now — it might be redeploying. Try again in a bit."]
       : CLIENT_FALLBACKS;
-    addMsg(pool[Math.floor(Math.random() * pool.length)], 'bot');
+    if(liveMsg){
+      liveMsg.textContent = pool[Math.floor(Math.random() * pool.length)];
+    } else {
+      addMsg(pool[Math.floor(Math.random() * pool.length)], 'bot');
+    }
     saveChatState();
   } finally {
     chatBusy = false;
@@ -1681,10 +1782,7 @@ chatFab.addEventListener('click', ()=>{
     const restored = loadChatState();
     if(!restored){
       setTimeout(() => {
-        addMsg(
-          "Hey, I'm Surya's AI twin 👋 Ask me anything about his experience, skills, projects — or go down a technical rabbit hole.",
-          'bot'
-        );
+        addMsg(INTRO_POOL[Math.floor(Math.random() * INTRO_POOL.length)], 'bot');
         saveChatState();
       }, 300);
     }
